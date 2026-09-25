@@ -1,0 +1,250 @@
+name: daily-update
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+on:
+  schedule:
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: 'Force build even if version is unchanged'
+        type: boolean
+        default: false
+      target_version:
+        description: 'Specify Waterfox version manually (e.g. 6.7.4)'
+        type: string
+        required: false
+
+jobs:
+  check-and-update:
+    runs-on: ubuntu-latest
+    outputs:
+      has_update: ${{ steps.check.outputs.has_update }}
+      version: ${{ steps.check.outputs.version }}
+      release: ${{ steps.check.outputs.release }}
+      tag: ${{ steps.check.outputs.tag }}
+      commit_sha: ${{ steps.commit.outputs.commit_sha }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check for latest Waterfox version
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TARGET_VERSION: ${{ inputs.target_version }}
+          INPUT_FORCE_BUILD: ${{ inputs.force_build }}
+        run: |
+          set -e
+
+          # 1. Determine target Waterfox version
+          if [ -n "$INPUT_TARGET_VERSION" ]; then
+            LATEST_VERSION="${INPUT_TARGET_VERSION#v}"
+            echo "Using manually specified version: $LATEST_VERSION"
+          else
+            LATEST_TAG=$(curl -sSL -H "Authorization: Bearer $GH_TOKEN" \
+              https://api.github.com/repos/WaterfoxCo/Waterfox/releases/latest | jq -r '.tag_name // empty')
+            if [ -z "$LATEST_TAG" ]; then
+              echo "Error: Failed to fetch latest release tag from WaterfoxCo/Waterfox"
+              exit 1
+            fi
+            LATEST_VERSION="${LATEST_TAG#v}"
+            echo "Latest upstream Waterfox release is: $LATEST_VERSION"
+          fi
+
+          # 2. Extract current version and release from build.properties
+          CURRENT_VERSION=$(grep -E '^[[:space:]]*app\.version[[:space:]]*=' build.properties | cut -d'=' -f2 | tr -d '[:space:]')
+          CURRENT_RELEASE=$(grep -E '^[[:space:]]*app\.release[[:space:]]*=' build.properties | cut -d'=' -f2 | tr -d '[:space:]')
+          echo "Current repository state: version=$CURRENT_VERSION, release=$CURRENT_RELEASE"
+
+          # 3. Check if update is needed
+          if [ "$LATEST_VERSION" != "$CURRENT_VERSION" ] || [ "$INPUT_FORCE_BUILD" = "true" ]; then
+            echo "Update criteria met. Verifying Waterfox installer on CDN..."
+            DOWNLOAD_URL="https://cdn1.waterfox.net/waterfox/releases/${LATEST_VERSION}/WINNT_x86_64/Waterfox%20Setup%20${LATEST_VERSION}.exe"
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -I -L "$DOWNLOAD_URL")
+            if [ "$HTTP_CODE" != "200" ]; then
+              echo "Error: Waterfox installer binary is not accessible at $DOWNLOAD_URL (HTTP $HTTP_CODE)"
+              exit 1
+            fi
+            echo "Waterfox installer binary verified at $DOWNLOAD_URL (HTTP 200)"
+
+            if [ "$LATEST_VERSION" != "$CURRENT_VERSION" ]; then
+              NEW_RELEASE=$((CURRENT_RELEASE + 1))
+            else
+              NEW_RELEASE=$CURRENT_RELEASE
+            fi
+
+            TAG_NAME="${LATEST_VERSION}-${NEW_RELEASE}"
+            echo "Preparing release $TAG_NAME..."
+
+            echo "has_update=true" >> "$GITHUB_OUTPUT"
+            echo "version=${LATEST_VERSION}" >> "$GITHUB_OUTPUT"
+            echo "release=${NEW_RELEASE}" >> "$GITHUB_OUTPUT"
+            echo "tag=${TAG_NAME}" >> "$GITHUB_OUTPUT"
+          else
+            echo "Repository is already up to date ($CURRENT_VERSION). No build required."
+            echo "has_update=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Update build.properties and CHANGELOG.md
+        if: steps.check.outputs.has_update == 'true'
+        shell: python
+        env:
+          NEW_VERSION: ${{ steps.check.outputs.version }}
+          NEW_RELEASE: ${{ steps.check.outputs.release }}
+          TAG_NAME: ${{ steps.check.outputs.tag }}
+        run: |
+          import os
+          import re
+          from datetime import datetime
+
+          new_ver = os.environ["NEW_VERSION"]
+          new_rel = os.environ["NEW_RELEASE"]
+          tag = os.environ["TAG_NAME"]
+          today = datetime.now().strftime("%Y/%m/%d")
+
+          # 1. Update build.properties
+          with open("build.properties", "r", encoding="utf-8") as f:
+              bp = f.read()
+
+          bp = re.sub(r"^(app\.version\s*=\s*).*", rf"\g<1>{new_ver}", bp, flags=re.MULTILINE)
+          bp = re.sub(r"^(app\.release\s*=\s*).*", rf"\g<1>{new_rel}", bp, flags=re.MULTILINE)
+
+          with open("build.properties", "w", encoding="utf-8", newline="") as f:
+              f.write(bp)
+
+          # 2. Update CHANGELOG.md
+          with open("CHANGELOG.md", "r", encoding="utf-8") as f:
+              cl = f.read()
+
+          if f"## {tag}" not in cl:
+              entry = f"## {tag} ({today})\n\n* Waterfox {new_ver}\n\n"
+              cl = re.sub(r"(# Changelog\s*\n+)", rf"\g<1>{entry}", cl)
+              with open("CHANGELOG.md", "w", encoding="utf-8", newline="") as f:
+                  f.write(cl)
+
+      - name: Commit, tag, and push changes
+        id: commit
+        if: steps.check.outputs.has_update == 'true'
+        env:
+          NEW_VERSION: ${{ steps.check.outputs.version }}
+          TAG_NAME: ${{ steps.check.outputs.tag }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add build.properties CHANGELOG.md
+
+          if git diff --cached --quiet; then
+            echo "No file changes detected."
+          else
+            git commit -m "Waterfox ${NEW_VERSION} [skip ci]"
+            git push origin master
+          fi
+
+          git tag -f "${TAG_NAME}"
+          git push origin "${TAG_NAME}" --force
+
+          echo "commit_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  build:
+    runs-on: windows-latest
+    needs: check-and-update
+    if: needs.check-and-update.outputs.has_update == 'true'
+    env:
+      GO_VERSION: '1.26'
+      NODE_VERSION: '20'
+      JAVA_VERSION: '11'
+      ANT_VERSION: '1.10.16'
+      JAVA_TOOL_OPTIONS: '-Dfile.encoding=UTF8'
+      GOTOOLCHAIN: local
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.check-and-update.outputs.commit_sha }}
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Set up ANT
+        uses: cedx/setup-ant@v6
+        with:
+          version: '=${{ env.ANT_VERSION }}'
+
+      - name: Java version
+        run: |
+          java -XshowSettings:properties -version
+
+      - name: ANT version
+        run: |
+          ant -version
+
+      - name: Node version
+        run: |
+          node --version
+
+      - name: Config
+        run: |
+          echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
+          echo "$(go env GOPATH)/bin/windows_386" >> $GITHUB_PATH
+          echo "PORTAPPS_VERSION=$(cat go.mod | grep github.com/portapps/portapps | awk '{print $NF}')" >> $GITHUB_ENV
+          echo "PORTAPPS_DIR=./.portapps" >> $GITHUB_ENV
+        shell: bash
+
+      - name: Checkout core
+        uses: actions/checkout@v4
+        with:
+          repository: portapps/portapps
+          ref: ${{ env.PORTAPPS_VERSION }}
+          path: ${{ env.PORTAPPS_DIR }}
+
+      - name: Cache Portapps bin
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.PORTAPPS_DIR }}/bin
+          key: portapps-bin-${{ env.PORTAPPS_VERSION }}
+
+      - name: Build
+        run: |
+          ant release -Dcore.dir=${{ env.PORTAPPS_DIR }}
+        shell: bash
+
+      - name: Upload assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: waterfox-portable-${{ needs.check-and-update.outputs.tag }}
+          path: bin/release/*
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.check-and-update.outputs.tag }}
+          name: ${{ needs.check-and-update.outputs.tag }}
+          draft: false
+          prerelease: false
+          files: |
+            bin/release/*
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
